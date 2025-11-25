@@ -53,30 +53,28 @@ def parse_flaps_from_outputs(text: str) -> Optional[str]:
     return m2.group(1).strip() if m2 else None
 
 
-def parse_trim(text: str) -> Optional[str]:
+def parse_speeds_from_outputs(text: str) -> Dict[str, Optional[int]]:
     """
-    Try to parse trim / stab trim.
-      STAB TRIM    5.0 UP
-      TRIM         4.5UP
-    Returns a raw string like '5.0 UP' or '4.5UP'.
+    Parse V1, VR, V2 from the OUTPUTS block.
+    Example lines:
+       FLAPS         5     V1          148
+       THRUST     D-TO1    VR          149
+       SEL TEMP     46     V2          156
     """
-    m = re.search(
-        r"STAB\s+TRIM\s+([0-9.]+\s*(?:UP|DN|DOWN)?)",
-        text,
-        re.IGNORECASE,
-    )
+    v1 = vr = v2 = None
+    m = re.search(r"OUTPUTS:([\s\S]*?)(?:MESSAGES:|$)", text)
     if m:
-        return m.group(1).strip()
-
-    m = re.search(
-        r"\bTRIM\s+([0-9.]+\s*(?:UP|DN|DOWN)?)",
-        text,
-        re.IGNORECASE,
-    )
-    if m:
-        return m.group(1).strip()
-
-    return None
+        block = m.group(1)
+        m_v1 = re.search(r"\bV1\s+(\d+)", block)
+        m_vr = re.search(r"\bVR\s+(\d+)", block)
+        m_v2 = re.search(r"\bV2\s+(\d+)", block)
+        if m_v1:
+            v1 = int(m_v1.group(1))
+        if m_vr:
+            vr = int(m_vr.group(1))
+        if m_v2:
+            v2 = int(m_v2.group(1))
+    return {"V1": v1, "VR": vr, "V2": v2}
 
 
 def parse_simbrief_takeoff_block(text: str) -> Dict[str, Any]:
@@ -86,8 +84,8 @@ def parse_simbrief_takeoff_block(text: str) -> Dict[str, Any]:
       - thrust mode (raw + normalized for tables)
       - BLEEDS / A/ICE (and packs/anti-ice flags for calc)
       - flaps (from OUTPUTS)
-      - trim (if present)
       - SEL TEMP (for FLEX logic)
+      - V1 / VR / V2 (from OUTPUTS)
     """
     airport = parse_field(r"APT\s+([A-Z]{4})", text)
     runway = parse_field(r"RWY\s+(\S+)", text)
@@ -116,7 +114,7 @@ def parse_simbrief_takeoff_block(text: str) -> Dict[str, Any]:
     sel_temp = parse_field(r"SEL TEMP\s+(\d+)", text, int)
 
     flaps_out = parse_flaps_from_outputs(text)
-    trim_raw = parse_trim(text)
+    speeds = parse_speeds_from_outputs(text)
 
     # Normalize thrust mode into MAX / TO1 / TO2 for N1 tables
     mode_norm = "MAX"
@@ -147,7 +145,7 @@ def parse_simbrief_takeoff_block(text: str) -> Dict[str, Any]:
         "anti_ice_for_calc": eng_anti_ice,  # bool
         "sel_temp_C": sel_temp,
         "flaps": flaps_out,                 # e.g. '5'
-        "trim_raw": trim_raw,               # e.g. '5.0 UP'
+        "speeds": speeds,                   # dict with V1, VR, V2
     }
 
 
@@ -171,9 +169,8 @@ def is_flex_active(
 def compute_takeoff_from_simbrief(text: str) -> Dict[str, Any]:
     """
     Returns:
-      - base (OAT, no FLEX) N1 + slider
-      - flex (SEL TEMP, if active) N1 + slider
-      - which one is actually used (SimBrief's D-TO logic)
+      - operational N1 + slider (base or FLEX, depending on SimBrief)
+      - flaps, thrust profile name, and V-speeds
     """
     info = parse_simbrief_takeoff_block(text)
 
@@ -205,12 +202,6 @@ def compute_takeoff_from_simbrief(text: str) -> Dict[str, Any]:
             packs=packs,
             eng_anti_ice=eng_aice,
         )
-    else:
-        flex_n1 = None
-        flex_slider = None
-
-    # 3) Operational (what you actually set)
-    if flex_active:
         op_n1 = flex_n1
         op_slider = flex_slider
         temp_used = sel_temp
@@ -223,12 +214,10 @@ def compute_takeoff_from_simbrief(text: str) -> Dict[str, Any]:
         "airport": info["airport"],
         "runway": info["runway"],
 
-        "thrust_mode_raw": mode_raw,
-        "thrust_mode_for_tables": mode_norm,
+        "thrust_mode_raw": mode_raw,          # thrust profile name from SimBrief
+        "thrust_mode_for_tables": mode_norm,  # MAX / TO1 / TO2
 
         "flaps": info["flaps"],
-        "trim": info["trim_raw"],
-
         "packs": packs,
         "eng_anti_ice": eng_aice,
 
@@ -237,19 +226,12 @@ def compute_takeoff_from_simbrief(text: str) -> Dict[str, Any]:
         "flex_active": flex_active,
         "temp_used_for_calc_C": temp_used,
 
-        "base": {
-            "temp_C": oat,
-            "N1_percent": round(base_n1, 2),
-            "IF_slider_percent": round(base_slider, 1),
-        },
-        "flex": {
-            "temp_C": sel_temp if flex_active else None,
-            "N1_percent": round(flex_n1, 2) if flex_active else None,
-            "IF_slider_percent": round(flex_slider, 1) if flex_active else None,
-        },
-
+        # Operational values (what to use in IF)
         "N1_percent": round(op_n1, 2),
         "IF_slider_percent": round(op_slider, 1),
+
+        # V-speeds
+        "speeds": info["speeds"],   # { "V1": int|None, "VR": int|None, "V2": int|None }
     }
 
 
@@ -259,14 +241,12 @@ def compute_takeoff_from_simbrief(text: str) -> Dict[str, Any]:
 
 def detect_aircraft(text: str) -> Optional[str]:
     """
-    Very simple aircraft detection from the header line, e.g.:
-      N808SB B737 MAX 8 LEAP-1B28
-    Returns 'B737 MAX 8' or None.
+    Detect aircraft from the TAKEOFF PERFORMANCE header line.
     """
     m = re.search(r"TAKEOFF PERFORMANCE\s*\n(.+)", text)
     if not m:
         return None
-    header_line = m.group(1).strip()
+    header_line = m.group(1).upper().strip()
 
     if "B737" in header_line and "MAX" in header_line and "8" in header_line:
         return "B737 MAX 8"
@@ -283,11 +263,11 @@ def main():
     st.title("SimBrief ➜ Infinite Flight Takeoff N1 (B737 MAX 8)")
 
     st.write(
-        "Paste your **SimBrief TAKEOFF PERFORMANCE** section below. "
+        "Paste your **SimBrief TAKEOFF PERFORMANCE** section below.\n\n"
         "If the aircraft is detected as **B737 MAX 8**, this tool will compute:\n"
-        "- Base (non-FLEX) N1 and IF power\n"
-        "- FLEX N1 and IF power (if applicable)\n"
-        "- Operational setting you should use in Infinite Flight."
+        "- Operational N1 and Infinite Flight power slider\n"
+        "- Flap setting and thrust profile (e.g. D-TO1)\n"
+        "- V1 / VR / V2 speeds from SimBrief"
     )
 
     simbrief_text = st.text_area(
@@ -312,52 +292,33 @@ def main():
                 st.error(f"Error computing N1: {e}")
                 return
 
-            # High-level summary
+            # === Row 1: Operational takeoff setting ===
             st.subheader("Operational Takeoff Setting")
-            col1, col2 = st.columns(2)
-            with col1:
+            row1_col1, row1_col2, row1_col3 = st.columns(3)
+            with row1_col1:
                 st.metric("N1 (Operational)", f"{result['N1_percent']} %")
+            with row1_col2:
                 st.metric("IF Power Slider", f"{result['IF_slider_percent']} %")
-            with col2:
+            with row1_col3:
                 st.metric("Flaps", result.get("flaps") or "N/A")
-                st.metric("Trim", result.get("trim") or "N/A")
 
-            # Base vs FLEX
-            st.subheader("Base vs FLEX Comparison")
+            # === Row 2: Thrust profile + V-speeds (same style & size) ===
+            st.subheader("Thrust Profile & V-Speeds")
 
-            base = result["base"]
-            flex = result["flex"]
+            speeds = result.get("speeds", {})
+            v1 = speeds.get("V1")
+            vr = speeds.get("VR")
+            v2 = speeds.get("V2")
 
-            c1, c2 = st.columns(2)
-
-            with c1:
-                st.markdown("**Base (no FLEX)** – using actual OAT")
-                st.write(f"Temperature: {base['temp_C']} °C")
-                st.write(f"N1: **{base['N1_percent']} %**")
-                st.write(f"IF Slider: **{base['IF_slider_percent']} %**")
-
-            with c2:
-                st.markdown("**FLEX (Assumed Temp)**")
-                if result["flex_active"]:
-                    st.write(f"SEL TEMP: {flex['temp_C']} °C")
-                    st.write(f"N1: **{flex['N1_percent']} %**")
-                    st.write(f"IF Slider: **{flex['IF_slider_percent']} %**")
-                else:
-                    st.write("FLEX not active (no D-TO or SEL TEMP ≤ OAT).")
-
-            # Extra details
-            st.subheader("Details")
-            st.json({
-                "airport": result["airport"],
-                "runway": result["runway"],
-                "thrust_mode_raw": result["thrust_mode_raw"],
-                "thrust_mode_for_tables": result["thrust_mode_for_tables"],
-                "packs": result["packs"],
-                "eng_anti_ice": result["eng_anti_ice"],
-                "oat_C": result["oat_C"],
-                "sel_temp_C": result["sel_temp_C"],
-                "temp_used_for_calc_C": result["temp_used_for_calc_C"],
-            })
+            row2_col1, row2_col2, row2_col3, row2_col4 = st.columns(4)
+            with row2_col1:
+                st.metric("Thrust Profile", result.get("thrust_mode_raw") or "N/A")
+            with row2_col2:
+                st.metric("V1", f"{v1} kt" if v1 is not None else "N/A")
+            with row2_col3:
+                st.metric("VR", f"{vr} kt" if vr is not None else "N/A")
+            with row2_col4:
+                st.metric("V2", f"{v2} kt" if v2 is not None else "N/A")
 
         else:
             st.warning(
