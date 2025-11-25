@@ -5,8 +5,9 @@ from typing import Optional, Dict, Any
 
 import streamlit as st
 
-# 737 MAX 8 N1 logic (your module)
-from b737max8N1 import n1_and_slider
+# N1 logic modules for each aircraft
+from b737max8N1 import n1_and_slider as n1_and_slider_737
+from b772erN1 import n1_and_slider_772
 
 
 # =========================
@@ -116,7 +117,7 @@ def parse_simbrief_takeoff_block(text: str) -> Dict[str, Any]:
     flaps_out = parse_flaps_from_outputs(text)
     speeds = parse_speeds_from_outputs(text)
 
-    # Normalize thrust mode into MAX / TO1 / TO2 for N1 tables
+    # Normalize thrust mode into MAX / TO1 / TO2
     mode_norm = "MAX"
     if thrust_mode_str:
         t = thrust_mode_str.upper()
@@ -129,7 +130,7 @@ def parse_simbrief_takeoff_block(text: str) -> Dict[str, Any]:
         else:
             mode_norm = "MAX"
 
-    # Normalize packs flag
+    # Normalize packs flag (used for 737 logic; ignored by 777 module)
     packs_for_calc = "on" if bleeds == "ON" else "off" if bleeds == "OFF" else "on"
 
     return {
@@ -166,11 +167,48 @@ def is_flex_active(
     return "D-TO" in mode_raw.upper()
 
 
-def compute_takeoff_from_simbrief(text: str) -> Dict[str, Any]:
+# =========================
+# Aircraft-specific N1 dispatcher
+# =========================
+
+def compute_n1_and_slider_for_aircraft(
+    aircraft: str,
+    mode_norm: str,
+    elev_ft: int,
+    temp_C: int,
+    packs: str,
+    eng_aice: bool,
+):
+    """
+    Dispatch to the correct N1 + slider function depending on aircraft.
+    - B737 MAX 8: uses full table + packs / anti-ice deltas
+    - B777-200ER: uses its own table and slider mapping; ignores packs/A-ICE
+    """
+    if aircraft == "B737 MAX 8":
+        return n1_and_slider_737(
+            mode_norm,
+            elev_ft,
+            temp_C,
+            packs=packs,
+            eng_anti_ice=eng_aice,
+        )
+    elif aircraft == "B777-200ER":
+        # 777 module does not currently model packs or anti-ice deltas
+        return n1_and_slider_772(
+            mode_norm,
+            elev_ft,
+            temp_C,
+        )
+    else:
+        raise ValueError(f"Unsupported aircraft for N1 calc: {aircraft}")
+
+
+def compute_takeoff_from_simbrief(text: str, aircraft: str) -> Dict[str, Any]:
     """
     Returns:
       - operational N1 + slider (base or FLEX, depending on SimBrief)
       - flaps, thrust profile name, and V-speeds
+    for the given aircraft type.
     """
     info = parse_simbrief_takeoff_block(text)
 
@@ -183,29 +221,33 @@ def compute_takeoff_from_simbrief(text: str) -> Dict[str, Any]:
     eng_aice = info["anti_ice_for_calc"]     # bool
 
     # 1) Base N1 at actual OAT (no FLEX)
-    base_n1, base_slider = n1_and_slider(
+    base_n1, base_slider = compute_n1_and_slider_for_aircraft(
+        aircraft,
         mode_norm,
         elev_ft,
         oat,
-        packs=packs,
-        eng_anti_ice=eng_aice,
+        packs,
+        eng_aice,
     )
 
     # 2) FLEX N1 at SEL TEMP (if active)
     flex_active = is_flex_active(oat, sel_temp, mode_raw)
 
-    if flex_active:
-        flex_n1, flex_slider = n1_and_slider(
+    if flex_active and sel_temp is not None:
+        flex_n1, flex_slider = compute_n1_and_slider_for_aircraft(
+            aircraft,
             mode_norm,
             elev_ft,
             sel_temp,
-            packs=packs,
-            eng_anti_ice=eng_aice,
+            packs,
+            eng_aice,
         )
         op_n1 = flex_n1
         op_slider = flex_slider
         temp_used = sel_temp
     else:
+        flex_n1 = None
+        flex_slider = None
         op_n1 = base_n1
         op_slider = base_slider
         temp_used = oat
@@ -218,8 +260,8 @@ def compute_takeoff_from_simbrief(text: str) -> Dict[str, Any]:
         "thrust_mode_for_tables": mode_norm,  # MAX / TO1 / TO2
 
         "flaps": info["flaps"],
-        "packs": packs,
-        "eng_anti_ice": eng_aice,
+        "packs": info["bleeds"],
+        "eng_anti_ice": info["anti_ice_for_calc"],
 
         "oat_C": oat,
         "sel_temp_C": sel_temp,
@@ -242,16 +284,28 @@ def compute_takeoff_from_simbrief(text: str) -> Dict[str, Any]:
 def detect_aircraft(text: str) -> Optional[str]:
     """
     Detect aircraft from the TAKEOFF PERFORMANCE header line.
+
+    Examples:
+      TAKEOFF PERFORMANCE
+      N808SB B737 MAX 8 LEAP-1B28
+
+      TAKEOFF PERFORMANCE
+      N777XX B777-200ER GE90-94B
     """
     m = re.search(r"TAKEOFF PERFORMANCE\s*\n(.+)", text)
     if not m:
         return None
     header_line = m.group(1).upper().strip()
 
+    # 737 MAX 8
     if "B737" in header_line and "MAX" in header_line and "8" in header_line:
         return "B737 MAX 8"
 
-    # (Extend here for other aircraft in the future)
+    # 777-200ER (B772)
+    if ("B777" in header_line and "200" in header_line) or "B772" in header_line:
+        return "B777-200ER"
+
+    # Extend here for other aircraft in the future
     return None
 
 
@@ -260,11 +314,14 @@ def detect_aircraft(text: str) -> Optional[str]:
 # =========================
 
 def main():
-    st.title("SimBrief ➜ Infinite Flight Takeoff N1 (B737 MAX 8)")
+    st.title("SimBrief ➜ Infinite Flight Takeoff N1")
 
     st.write(
         "Paste your **SimBrief TAKEOFF PERFORMANCE** section below.\n\n"
-        "If the aircraft is detected as **B737 MAX 8**, this tool will compute:\n"
+        "Currently supported aircraft:\n"
+        "- **B737 MAX 8**\n"
+        "- **B777-200ER**\n\n"
+        "For supported aircraft, this tool computes:\n"
         "- Operational N1 and Infinite Flight power slider\n"
         "- Flap setting and thrust profile (e.g. D-TO1)\n"
         "- V1 / VR / V2 speeds from SimBrief"
@@ -283,11 +340,11 @@ def main():
 
         aircraft = detect_aircraft(simbrief_text)
 
-        if aircraft == "B737 MAX 8":
+        if aircraft in {"B737 MAX 8", "B777-200ER"}:
             st.success(f"Detected aircraft: {aircraft}")
 
             try:
-                result = compute_takeoff_from_simbrief(simbrief_text)
+                result = compute_takeoff_from_simbrief(simbrief_text, aircraft)
             except Exception as e:
                 st.error(f"Error computing N1: {e}")
                 return
@@ -302,7 +359,7 @@ def main():
             with row1_col3:
                 st.metric("Flaps", result.get("flaps") or "N/A")
 
-            # === Row 2: Thrust profile + V-speeds (same style & size) ===
+            # === Row 2: Thrust profile + V-speeds ===
             st.subheader("Thrust Profile & V-Speeds")
 
             speeds = result.get("speeds", {})
@@ -322,7 +379,8 @@ def main():
 
         else:
             st.warning(
-                "This SimBrief text does not appear to be for a **B737 MAX 8**.\n\n"
+                "This SimBrief text does not appear to be for a supported aircraft "
+                "(B737 MAX 8 or B777-200ER).\n\n"
                 "Support for additional aircraft is currently in progress and "
                 "will be added in the future."
             )
