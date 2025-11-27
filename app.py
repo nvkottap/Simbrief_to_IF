@@ -1,341 +1,13 @@
 # app.py
 
-import re
-from typing import Optional, Dict, Any
+from typing import Optional
 
 import streamlit as st
 import streamlit.components.v1 as components
 
-
-# N1 logic modules for each aircraft
-from b737max8N1 import n1_and_slider as n1_and_slider_737
-from b772erN1 import n1_and_slider_772
-from a223N1 import n1_and_slider_a223
-from a380N1 import n1_and_slider_a380
-
-
-# =========================
-# Parsing helpers
-# =========================
-
-def parse_field(pattern: str, text: str, cast=str, default=None, flags=0):
-    m = re.search(pattern, text, flags)
-    if not m:
-        return default
-    val = m.group(1).strip()
-    try:
-        return cast(val)
-    except Exception:
-        return val
-
-
-def parse_thrust_mode(text: str) -> Optional[str]:
-    """
-    Prefer THRUST from the OUTPUTS block; fall back to first THRUST line.
-    """
-    m = re.search(r"OUTPUTS:([\s\S]*?)\n\n", text)
-    if m:
-        block = m.group(1)
-        m2 = re.search(r"\bTHRUST\s+([A-Z0-9\-]+)", block)
-        if m2:
-            return m2.group(1).strip()
-
-    m = re.search(r"\bTHRUST\s+([A-Z0-9\-]+)", text)
-    return m.group(1).strip() if m else None
-
-
-def parse_flaps_from_outputs(text: str) -> Optional[str]:
-    """
-    Grab FLAPS from OUTPUTS (not INPUTS).
-    Example: 'FLAPS         5     V1  148'
-    """
-    m = re.search(r"OUTPUTS:([\s\S]*?)(?:MESSAGES:|$)", text)
-    if not m:
-        return None
-    block = m.group(1)
-
-    m2 = re.search(r"\bFLAPS\s+([A-Z0-9]+)", block)
-    return m2.group(1).strip() if m2 else None
-
-
-def parse_speeds_from_outputs(text: str) -> Dict[str, Optional[int]]:
-    """
-    Parse V1, VR, V2 from the OUTPUTS block.
-    Example lines:
-       FLAPS         5     V1          148
-       THRUST     D-TO1    VR          149
-       SEL TEMP     46     V2          156
-    """
-    v1 = vr = v2 = None
-    m = re.search(r"OUTPUTS:([\s\S]*?)(?:MESSAGES:|$)", text)
-    if m:
-        block = m.group(1)
-        m_v1 = re.search(r"\bV1\s+(\d+)", block)
-        m_vr = re.search(r"\bVR\s+(\d+)", block)
-        m_v2 = re.search(r"\bV2\s+(\d+)", block)
-        if m_v1:
-            v1 = int(m_v1.group(1))
-        if m_vr:
-            vr = int(m_vr.group(1))
-        if m_v2:
-            v2 = int(m_v2.group(1))
-    return {"V1": v1, "VR": vr, "V2": v2}
-
-
-def parse_simbrief_takeoff_block(text: str) -> Dict[str, Any]:
-    """
-    Parses SimBrief takeoff performance section, including:
-      - airport, runway, elevation, OAT
-      - thrust mode (raw + normalized for tables)
-      - BLEEDS / A/ICE (and packs/anti-ice flags for calc)
-      - flaps (from OUTPUTS)
-      - SEL TEMP (for FLEX logic)
-      - V1 / VR / V2 (from OUTPUTS)
-    """
-    airport = parse_field(r"APT\s+([A-Z]{4})", text)
-    runway = parse_field(r"RWY\s+(\S+)", text)
-
-    oat = parse_field(r"OAT\s+([\-]?\d+)", text, int)
-    elev_ft = parse_field(r"ELEV\s+(\d+)", text, int)
-
-    # BLEEDS / AICE in INPUTS
-    bleeds_in = parse_field(r"INPUTS:[\s\S]*?BLEEDS\s+(ON|OFF|AUTO)", text)
-    aice_in = parse_field(r"INPUTS:[\s\S]*?A/ICE\s+([A-Z]+)", text)
-
-    # BLEEDS / AICE in OUTPUTS (more authoritative)
-    bleeds_out = parse_field(r"RWY LIM\s+[0-9.]+\s+BLEEDS\s+(ON|OFF)", text)
-    aice_out = parse_field(r"LIM CODE\s+\S+\s+A/ICE\s+([A-Z]+)", text)
-
-    bleeds = (bleeds_out or bleeds_in or "AUTO").upper()
-    aice_raw = (aice_out or aice_in or "AUTO").upper()
-
-    # Interpret A/ICE:
-    #  - ON / ALL / ENG / ENG+WING => engine anti-ice ON
-    eng_anti_ice = False
-    if aice_raw in {"ON", "ALL", "ENG", "ENG+WING"}:
-        eng_anti_ice = True
-
-    thrust_mode_str = parse_thrust_mode(text)
-    sel_temp = parse_field(r"SEL TEMP\s+(\d+)", text, int)
-
-    flaps_out = parse_flaps_from_outputs(text)
-    speeds = parse_speeds_from_outputs(text)
-
-    # Normalize thrust mode into MAX / TO1 / TO2 / FLEX-type
-    mode_norm = "MAX"
-    if thrust_mode_str:
-        t = thrust_mode_str.upper()
-        if "TO2" in t:
-            mode_norm = "TO2"
-        elif "TO1" in t:
-            mode_norm = "TO1"
-        elif "FLEX" in t:
-            mode_norm = "FLEX"
-        elif t in {"D-TO", "DTO"}:
-            mode_norm = "MAX"
-        else:
-            mode_norm = "MAX"
-
-    # Normalize packs flag (used for some aircraft; ignored for others)
-    packs_for_calc = "on" if bleeds == "ON" else "off" if bleeds == "OFF" else "on"
-
-    return {
-        "airport": airport,
-        "runway": runway,
-        "oat_C": oat,
-        "elevation_ft": elev_ft,
-        "mode_raw": thrust_mode_str,        # e.g. 'D-TO2', 'FLEX'
-        "mode_normalized": mode_norm,       # 'MAX' | 'TO1' | 'TO2' | 'FLEX'
-        "bleeds": bleeds,                   # ON/OFF/AUTO
-        "packs_for_calc": packs_for_calc,   # 'on' | 'off'
-        "aice_raw": aice_raw,               # e.g. 'ENG'
-        "anti_ice_for_calc": eng_anti_ice,  # bool
-        "sel_temp_C": sel_temp,
-        "flaps": flaps_out,                 # e.g. '5'
-        "speeds": speeds,                   # dict with V1, VR, V2
-    }
-
-
-def is_flex_active(
-    oat_C: Optional[int],
-    sel_temp_C: Optional[int],
-    mode_raw: Optional[str],
-) -> bool:
-    """
-    FLEX active if:
-      - thrust mode contains 'D-TO' or 'FLEX'
-      - SEL TEMP > OAT
-    """
-    if oat_C is None or sel_temp_C is None or mode_raw is None:
-        return False
-    if sel_temp_C <= oat_C:
-        return False
-    return ("D-TO" in mode_raw.upper()) or ("FLEX" in mode_raw.upper())
-
-
-# =========================
-# Aircraft-specific N1 dispatcher
-# =========================
-
-def compute_n1_and_slider_for_aircraft(
-    aircraft: str,
-    mode_norm: str,
-    elev_ft: int,
-    temp_C: int,
-    packs: str,
-    eng_aice: bool,
-):
-    """
-    Dispatch to the correct N1 + slider function depending on aircraft.
-    """
-    if aircraft == "B737 MAX 8":
-        return n1_and_slider_737(
-            mode_norm,
-            elev_ft,
-            temp_C,
-            packs=packs,
-            eng_anti_ice=eng_aice,
-        )
-    elif aircraft == "B777-200ER":
-        return n1_and_slider_772(
-            mode_norm,
-            elev_ft,
-            temp_C,
-        )
-    elif aircraft == "A220-300":
-        return n1_and_slider_a223(
-            mode_norm,
-            elev_ft,
-            temp_C,
-            packs=packs,
-            eng_anti_ice=eng_aice,
-        )
-    elif aircraft == "A380-800":
-        # For A380 we always use MAX MTO at actual OAT; mode_norm is ignored.
-        return n1_and_slider_a380(
-            mode_norm,
-            elev_ft,
-            temp_C,
-        )
-    else:
-        raise ValueError(f"Unsupported aircraft for N1 calc: {aircraft}")
-
-
-def compute_takeoff_from_simbrief(text: str, aircraft: str) -> Dict[str, Any]:
-    """
-    Returns:
-      - operational N1 + slider (base or FLEX, depending on SimBrief & aircraft)
-      - flaps, thrust profile name, and V-speeds
-    for the given aircraft type.
-    """
-    info = parse_simbrief_takeoff_block(text)
-
-    oat = info["oat_C"]
-    sel_temp = info["sel_temp_C"]
-    mode_raw = info["mode_raw"]              # e.g. 'D-TO2', 'FLEX'
-    mode_norm = info["mode_normalized"]      # 'MAX' | 'TO1' | 'TO2' | 'FLEX'
-    elev_ft = info["elevation_ft"]
-    packs = info["packs_for_calc"]           # 'on' | 'off'
-    eng_aice = info["anti_ice_for_calc"]     # bool
-
-    # 1) Base N1 at actual OAT
-    base_n1, base_slider = compute_n1_and_slider_for_aircraft(
-        aircraft,
-        mode_norm,
-        elev_ft,
-        oat,
-        packs,
-        eng_aice,
-    )
-
-    # 2) FLEX logic
-    if aircraft == "A380-800":
-        # For A380 we ALWAYS use MAX MTO at actual OAT, ignoring FLEX/derates.
-        flex_active = False
-    else:
-        flex_active = is_flex_active(oat, sel_temp, mode_raw)
-
-    if flex_active and sel_temp is not None:
-        flex_n1, flex_slider = compute_n1_and_slider_for_aircraft(
-            aircraft,
-            mode_norm,
-            elev_ft,
-            sel_temp,
-            packs,
-            eng_aice,
-        )
-        op_n1 = flex_n1
-        op_slider = flex_slider
-        temp_used = sel_temp
-    else:
-        flex_n1 = None
-        flex_slider = None
-        op_n1 = base_n1
-        op_slider = base_slider
-        temp_used = oat
-
-    return {
-        "airport": info["airport"],
-        "runway": info["runway"],
-
-        "thrust_mode_raw": mode_raw,          # thrust profile name from SimBrief
-        "thrust_mode_for_tables": mode_norm,  # MAX / TO1 / TO2 / FLEX
-
-        "flaps": info["flaps"],
-        "packs": info["bleeds"],
-        "eng_anti_ice": info["anti_ice_for_calc"],
-
-        "oat_C": oat,
-        "sel_temp_C": sel_temp,
-        "flex_active": flex_active,
-        "temp_used_for_calc_C": temp_used,
-
-        # Operational values (what to use in IF)
-        "N1_percent": round(op_n1, 2) if op_n1 is not None else None,
-        "IF_slider_percent": round(op_slider, 1) if op_slider is not None else None,
-
-        # V-speeds
-        "speeds": info["speeds"],   # { "V1": int|None, "VR": int|None, "V2": int|None }
-    }
-
-
-# =========================
-# Aircraft detection
-# =========================
-
-def detect_aircraft(text: str) -> Optional[str]:
-    """
-    Detect aircraft from the TAKEOFF PERFORMANCE header line.
-
-    Examples:
-      N808SB B737 MAX 8 LEAP-1B28
-      N755SB B777-200ER GE90-94B
-      N388SB A380-800 TRENT 970-84
-      C-GXXX A220-300 PW1524G
-    """
-    m = re.search(r"TAKEOFF PERFORMANCE\s*\n(.+)", text)
-    if not m:
-        return None
-    header_line = m.group(1).upper().strip()
-
-    # 737 MAX 8
-    if "B737" in header_line and "MAX" in header_line and "8" in header_line:
-        return "B737 MAX 8"
-
-    # 777-200ER (B772)
-    if ("B777" in header_line and "200" in header_line) or "B772" in header_line:
-        return "B777-200ER"
-
-    # A220-300 / BD-500-300 etc.
-    if "A220-300" in header_line or "BD-500-300" in header_line or "A223" in header_line:
-        return "A220-300"
-
-    # A380-800
-    if "A380-800" in header_line or "A388" in header_line:
-        return "A380-800"
-
-    # Extend here for more aircraft later
-    return None
+# Our own helpers
+from utils.simbrief_parser import detect_aircraft
+from utils.n1_dispatcher import compute_takeoff_from_simbrief
 
 
 # =========================
@@ -396,7 +68,7 @@ def render_ecam_gauge(slider_percent: Optional[float], n1_percent: Optional[floa
           margin-top: 2px;
         }}
 
-        /* perfect semicircle */
+        /* semicircle */
         .dial-wrapper {{
           position: relative;
           width: 140px;
@@ -501,8 +173,6 @@ def render_ecam_gauge(slider_percent: Optional[float], n1_percent: Optional[floa
     components.html(gauge_html, height=240)
 
 
-
-
 def render_flaps_airbus(flaps_value: Optional[str]):
     """
     Airbus-style flap indicator (A220 / A380):
@@ -516,8 +186,6 @@ def render_flaps_airbus(flaps_value: Optional[str]):
 
     # Order of Airbus detents we care about visually
     detents = ["0", "1", "1+F", "2", "3", "FULL"]
-    # map FULL to F for text on top line
-    short_text = flaps_str.replace("FULL", "F")
 
     # find index for highlighting
     try:
@@ -590,6 +258,7 @@ def render_flaps_airbus(flaps_value: Optional[str]):
     </html>
     """
     components.html(html, height=120)
+
 
 def render_flaps_b777(flaps_value: Optional[str]):
     """
@@ -673,6 +342,7 @@ def render_flaps_b777(flaps_value: Optional[str]):
     """
     components.html(html, height=190)
 
+
 def render_flaps_737max(flaps_value: Optional[str]):
     """
     737 MAX-style flap dial.
@@ -686,7 +356,7 @@ def render_flaps_737max(flaps_value: Optional[str]):
 
     detents = ["0", "1", "2", "5", "10", "15", "25", "30", "40"]
 
-    # Manually tuned angles to roughly match a real 737 dial (deg, clockwise)
+    # Manually tuned angles to roughly match the IF dial
     angle_map = {
         "0":  -115,
         "1":   -85,
@@ -699,14 +369,12 @@ def render_flaps_737max(flaps_value: Optional[str]):
         "40":  105
     }
 
-    # Fallback to 0 if unknown
     needle_angle = angle_map.get(flaps_str, angle_map["0"])
 
     # Build ticks & labels using the same angles
     ticks_html = ""
     for label in detents:
         a = angle_map[label]
-
         ticks_html += f"""
         <!-- tick {label} -->
         <div class="b737-tick"
@@ -817,8 +485,6 @@ def render_flaps_737max(flaps_value: Optional[str]):
     components.html(html, height=230)
 
 
-
-
 # =========================
 # Streamlit UI
 # =========================
@@ -868,16 +534,21 @@ def main():
             row1_col1, row1_col2, row1_col3 = st.columns(3)
             with row1_col1:
                 n1_val = result['N1_percent']
-                st.metric("N1 (Operational)", f"{n1_val:.2f} %" if n1_val is not None else "N/A")
+                st.metric(
+                    "N1 (Operational)",
+                    f"{n1_val:.2f} %" if n1_val is not None else "N/A"
+                )
             with row1_col2:
                 s_val = result['IF_slider_percent']
-                st.metric("IF Power Slider", f"{s_val:.1f} %" if s_val is not None else "N/A")
+                st.metric(
+                    "IF Power Slider",
+                    f"{s_val:.1f} %" if s_val is not None else "N/A"
+                )
             with row1_col3:
                 st.metric("Flaps", result.get("flaps") or "N/A")
 
             # === Row 2: Thrust profile + V-speeds ===
             st.subheader("Thrust Profile & V-Speeds")
-
             speeds = result.get("speeds", {})
             v1 = speeds.get("V1")
             vr = speeds.get("VR")
@@ -901,10 +572,8 @@ def main():
                 st.caption("Engine Thrust Gauge (ECAM style)")
                 render_ecam_gauge(result['IF_slider_percent'], result['N1_percent'])
 
-
             with vcol2:
                 st.caption("Flaps Configuration")
-
                 flaps_val = result.get("flaps")
 
                 if aircraft in {"A220-300", "A380-800"}:
@@ -915,7 +584,6 @@ def main():
                     render_flaps_737max(flaps_val)
                 else:
                     st.write(flaps_val or "N/A")
-
 
         else:
             st.warning(
