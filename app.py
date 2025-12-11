@@ -1,597 +1,482 @@
-# app.py
+import html
+from typing import Any, Dict
 
-from typing import Optional
-
+import requests
 import streamlit as st
-import streamlit.components.v1 as components
 
-# Our own helpers
-from utils.simbrief_parser import detect_aircraft
-from utils.n1_dispatcher import compute_takeoff_from_simbrief
+from utils.simbrief_parser import (
+    detect_aircraft_from_json,
+    parse_takeoff_from_json,
+    parse_ofp_overview_from_json,
+)
+from utils.n1_dispatcher import compute_takeoff_from_info
+from utils.metar_decode import decode_metar
 
 
-# =========================
-# Visual components (HTML/CSS)
-# =========================
+# ----------------------------------------------------------------------
+# Page config + CSS theme
+# ----------------------------------------------------------------------
+st.set_page_config(
+    page_title="IF Takeoff Helper",
+    page_icon="✈️",
+    layout="wide",
+)
 
-def render_ecam_gauge(slider_percent: Optional[float], n1_percent: Optional[float]):
-    if slider_percent is None or n1_percent is None:
-        st.write("Gauge: N/A")
-        return
-
-    sp = max(0.0, min(100.0, float(slider_percent)))
-    n1 = max(0.0, min(150.0, float(n1_percent)))
-
-    # slider -> dial angle
-    angle = sp / 100 * 180 - 90
-
-    gauge_html = f"""
-    <html>
-    <head>
-      <style>
-        body {{
-          margin: 0;
-          padding: 0;
-          background: transparent;
-        }}
-
-        .gauge-card {{
-          background: #000;
-          border-radius: 12px;
-          padding: 12px 16px 20px 16px;
-          display: inline-flex;
-          align-items: flex-start;
-          justify-content: center;
-          gap: 14px;
-          font-family: monospace;
-        }}
-
-        .thr-label {{
-          color: #9be38c;
-          font-size: 14px;
-          text-align: center;
-          line-height: 1.1;
-          margin-top: 26px;
-        }}
-
-        .right-side {{
-          display: flex;
-          flex-direction: column;
-          align-items: center;
-        }}
-
-        /* IF THROTTLE label */
-        .if-label {{
-          color: #ffffff90;
-          font-size: 12px;
-          margin-bottom: 6px;
-          margin-top: 2px;
-        }}
-
-        /* semicircle */
-        .dial-wrapper {{
-          position: relative;
-          width: 140px;
-          height: 90px;
-        }}
-
-        .dial {{
-          position: absolute;
-          left: 0;
-          bottom: 0;
-          width: 140px;
-          height: 70px;
-          border-radius: 140px 140px 0 0;
-          border: 3px solid #cfcfcf;
-          border-bottom: none;
-          background: radial-gradient(circle at 50% 120%, #222 0%, #000 70%);
-        }}
-
-        /* extended needle */
-        .needle {{
-          position: absolute;
-          bottom: 0;
-          left: 50%;
-          width: 3px;
-          height: 82%;
-          background: #6df36d;
-          transform-origin: bottom center;
-          transform: translateX(-50%) rotate({angle}deg);
-          box-shadow: 0 0 4px rgba(0,0,0,0.7);
-        }}
-
-        /* ticks */
-        .tick {{
-          position: absolute;
-          color: #f0f0f0;
-          font-size: 12px;
-        }}
-
-        .tick0 {{ bottom: 2px; left: 8px; }}
-        .tick5 {{ top: 4px; left: 50%; transform: translateX(-50%); }}
-        .tick10 {{ bottom: 2px; right: 8px; }}
-
-        /* N1 box + label */
-        .n1-label {{
-          margin-top: 6px;
-          color: #ffffff90;
-          font-size: 12px;
-        }}
-
-        .n1-box {{
-          margin-top: 4px;
-          width: 100px;
-          height: 40px;
-          border-radius: 6px;
-          border: 2px solid #6df36d;
-          background: #222;
-          display: flex;
-          align-items: center;
-          justify-content: center;
-          font-size: 20px;
-          color: #6df36d;
-          box-shadow: 0 0 6px rgba(0,0,0,0.6);
-        }}
-      </style>
-    </head>
-
-    <body>
-      <div class="gauge-card">
-
-        <!-- left THR % label -->
-        <div class="thr-label">
-          THR<br>% 
-        </div>
-
-        <div class="right-side">
-
-          <!-- IF SLIDER LABEL -->
-          <div class="if-label">IF THROTTLE</div>
-
-          <div class="dial-wrapper">
-            <div class="dial">
-              <div class="needle"></div>
-
-              <div class="tick tick0">0</div>
-              <div class="tick tick5">5</div>
-              <div class="tick tick10">10</div>
-            </div>
-          </div>
-
-          <!-- N1 DIGITAL LABEL -->
-          <div class="n1-label">N1 %</div>
-
-          <div class="n1-box">{n1:.1f}</div>
-
-        </div>
-
-      </div>
-    </body>
-    </html>
+st.markdown(
     """
-
-    components.html(gauge_html, height=240)
-
-
-def render_flaps_airbus(flaps_value: Optional[str]):
-    """
-    Airbus-style flap indicator (A220 / A380):
-    ladder with S .... F and a green symbol + text (0, 1, 1+F, 2, 3, FULL)
-    """
-    if not flaps_value:
-        st.write("Flaps: N/A")
-        return
-
-    flaps_str = str(flaps_value).upper()
-
-    # Order of Airbus detents we care about visually
-    detents = ["0", "1", "1+F", "2", "3", "FULL"]
-
-    # find index for highlighting
-    try:
-        idx = detents.index(flaps_str)
-    except ValueError:
-        idx = 0
-
-    # build little squares, highlight the selected one in green
-    boxes_html = ""
-    for i, d in enumerate(detents):
-        if i == idx:
-            boxes_html += (
-                '<div style="width:10px;height:10px;border-radius:2px;'
-                'border:2px solid #9be38c;background:#041;">'
-                "</div>"
-            )
-        else:
-            boxes_html += (
-                '<div style="width:8px;height:8px;border-radius:2px;'
-                'border:1px solid #eee;background:transparent;"></div>'
-            )
-
-    html = f"""
-    <html>
-    <head>
-      <style>
-        .airbus-flaps-card {{
-          background:#000;
-          border-radius:12px;
-          padding:10px 14px;
-          display:inline-flex;
-          flex-direction:column;
-          align-items:center;
-          font-family:monospace;
-          color:#fff;
-        }}
-        .airbus-top-row {{
-          display:flex;
-          justify-content:space-between;
-          width:150px;
-          font-size:12px;
-          margin-bottom:2px;
-        }}
-        .airbus-ladder {{
-          display:flex;
-          justify-content:space-between;
-          align-items:center;
-          width:150px;
-          margin-bottom:4px;
-        }}
-        .airbus-mode {{
-          margin-top:2px;
-          font-size:16px;
-          color:#9be38c;
-        }}
-      </style>
-    </head>
-    <body style="margin:0;padding:0;background:transparent;">
-      <div class="airbus-flaps-card">
-        <div class="airbus-top-row">
-          <span>S</span>
-          <span>F</span>
-        </div>
-        <div class="airbus-ladder">
-          {boxes_html}
-        </div>
-        <div class="airbus-mode">{flaps_str}</div>
-      </div>
-    </body>
-    </html>
-    """
-    components.html(html, height=120)
-
-
-def render_flaps_b777(flaps_value: Optional[str]):
-    """
-    777-style vertical flaps tape.
-    SimBrief values: 0, 1, 5, 15, 20, 25, 30
-    """
-    if flaps_value is None:
-        st.write("Flaps: N/A")
-        return
-
-    try:
-        val = float(flaps_value)
-    except ValueError:
-        val = 0.0
-
-    detents = [0, 1, 5, 15, 20, 25, 30]
-    v_min, v_max = min(detents), max(detents)
-    frac = (val - v_min) / (v_max - v_min) if v_max > v_min else 0.0
-    frac = max(0.0, min(1.0, frac))
-
-    html = f"""
-    <html>
-    <head>
-      <style>
-        .b777-card {{
-          background:#000;
-          border-radius:12px;
-          padding:10px 16px;
-          display:inline-flex;
-          align-items:center;
-          justify-content:center;
-          font-family:monospace;
-        }}
-        .b777-label {{
-          color:#00f7ff;
-          font-size:14px;
-          margin-right:8px;
-          letter-spacing:2px;
-        }}
-        .b777-container {{
-          position:relative;
-          width:60px;
-          height:150px;
-          border:2px solid #888;
-          background:#111;
-          display:flex;
-          align-items:flex-end;
-          justify-content:center;
-          box-shadow:0 0 6px rgba(0,0,0,0.7);
-        }}
-        .b777-green-bar {{
-          position:absolute;
-          left:0;
-          right:0;
-          height:4px;
-          background:#6df36d;
-          bottom:{frac*100:.1f}%;
-        }}
-        .b777-value {{
-          position:absolute;
-          right:-40px;
-          bottom:{frac*100:.1f}%;
-          color:#6df36d;
-          font-size:18px;
-          transform:translateY(50%);
-        }}
-      </style>
-    </head>
-    <body style="margin:0;padding:0;background:transparent;">
-      <div class="b777-card">
-        <div class="b777-label">
-          F<br>L<br>A<br>P<br>S
-        </div>
-        <div class="b777-container">
-          <div class="b777-green-bar"></div>
-          <div class="b777-value">{val:g}</div>
-        </div>
-      </div>
-    </body>
-    </html>
-    """
-    components.html(html, height=190)
-
-
-def render_flaps_737max(flaps_value: Optional[str]):
-    """
-    737 MAX-style flap dial.
-    SimBrief values: 0, 1, 2, 5, 10, 15, 25, 30, 40
-    """
-    if flaps_value is None:
-        st.write("Flaps: N/A")
-        return
-
-    flaps_str = str(flaps_value).strip().upper()
-
-    detents = ["0", "1", "2", "5", "10", "15", "25", "30", "40"]
-
-    # Manually tuned angles to roughly match the IF dial
-    angle_map = {
-        "0":  -115,
-        "1":   -85,
-        "2":   -60,
-        "5":   -30,
-        "10":    0,
-        "15":   30,
-        "25":   55,
-        "30":   80,
-        "40":  105
+    <style>
+    .if-card {
+        background-color: #0f172a;
+        border-radius: 0.75rem;
+        padding: 0.75rem 1rem;
+        border: 1px solid #1f2937;
+        margin-bottom: 0.75rem;
     }
+    .if-card-title {
+        font-size: 0.75rem;
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+        color: #9ca3af;
+        margin-bottom: 0.15rem;
+    }
+    .if-card-value {
+        font-size: 1.4rem;
+        font-weight: 600;
+        color: #f9fafb;
+        margin-bottom: 0.15rem;
+    }
+    .if-card-sub {
+        font-size: 0.85rem;
+        color: #d1d5db;
+        line-height: 1.25;
+    }
+    .if-chip {
+        display: inline-block;
+        padding: 0.15rem 0.45rem;
+        border-radius: 999px;
+        font-size: 0.70rem;
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+        background-color: #111827;
+        color: #e5e7eb;
+        margin-bottom: 0.4rem;
+    }
+    .if-chip-blue { background-color: #1d4ed8; color: #eff6ff; }
+    .if-chip-orange { background-color: #c2410c; color: #fff7ed; }
+    .if-chip-green { background-color: #065f46; color: #ecfdf5; }
+    .if-small {
+        font-size: 0.9rem;
+        color: #e5e7eb;
+        line-height: 1.35;
+        white-space: pre-line;
+    }
+    .if-pre {
+        background: #0b1220;
+        border: 1px solid #1f2937;
+        border-radius: 0.6rem;
+        padding: 0.75rem 0.85rem;
+        color: #e5e7eb;
+        overflow-x: auto;
+        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+        font-size: 0.9rem;
+        margin-top: 0.35rem;
+        margin-bottom: 0.25rem;
+        white-space: pre-wrap;
+        word-break: break-word;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
-    needle_angle = angle_map.get(flaps_str, angle_map["0"])
 
-    # Build ticks & labels using the same angles
-    ticks_html = ""
-    for label in detents:
-        a = angle_map[label]
-        ticks_html += f"""
-        <!-- tick {label} -->
-        <div class="b737-tick"
-             style="transform:translate(-50%, -50%) rotate({a}deg) translate(0, -70px);">
-        </div>
+# ----------------------------------------------------------------------
+# Helper: fetch SimBrief OFP JSON for a username
+# ----------------------------------------------------------------------
+def fetch_simbrief_ofp_json(username: str) -> Dict[str, Any]:
+    """
+    Fetch SimBrief OFP JSON via the public API (latest OFP for username).
+    """
+    base_url = "https://www.simbrief.com/api/xml.fetcher.php"  # correct endpoint
+    params = {"username": username, "json": "v2"}  # v2 tends to be more stable
 
-        <!-- label {label} -->
-        <div class="b737-num"
-             style="transform:translate(-50%, -50%) rotate({a}deg) translate(0, -88px) rotate({-a}deg);">
-          {label}
-        </div>
-        """
+    resp = requests.get(base_url, params=params, timeout=20)
 
-    html = f"""
-    <html>
-    <head>
-      <style>
-        body {{
-          margin:0;
-          padding:0;
-          background:transparent;
-        }}
+    if resp.status_code in (400, 404):
+        raise RuntimeError(
+            f"SimBrief fetch failed (HTTP {resp.status_code}). "
+            "Double-check the SimBrief username and ensure a recent OFP was generated."
+        )
 
-        .b737-card {{
-          background:#000;
-          border-radius:16px;
-          padding:12px;
-          display:inline-flex;
-          flex-direction:column;
-          align-items:center;
-          font-family:monospace;
-          color:#fff;
-        }}
+    resp.raise_for_status()
 
-        .b737-dial {{
-          position:relative;
-          width:180px;
-          height:180px;
-          border-radius:50%;
-          border:4px solid #888;
-          background:#111;
-          margin-bottom:6px;
-        }}
+    try:
+        ofp = resp.json()
+    except Exception:
+        raise RuntimeError(f"SimBrief did not return JSON. Response was:\n{resp.text[:800]}")
 
-        .b737-tick {{
-          position:absolute;
-          top:50%;
-          left:50%;
-          width:2px;
-          height:10px;
-          background:#fff;
-          transform-origin:bottom center;
-        }}
+    if not isinstance(ofp, dict):
+        raise ValueError("SimBrief JSON response is not a dict")
 
-        .b737-num {{
-          position:absolute;
-          top:50%;
-          left:50%;
-          color:#fff;
-          font-size:11px;
-          transform-origin:center;
-        }}
+    return ofp
 
-        .b737-needle {{
-          position:absolute;
-          top:50%;
-          left:50%;
-          width:70px;
-          height:3px;
-          background:#ffffff;
-          transform-origin:left center;
-          transform:translate(-50%, -50%) rotate({needle_angle}deg);
-        }}
 
-        .b737-center {{
-          position:absolute;
-          top:50%;
-          left:50%;
-          width:18px;
-          height:18px;
-          border-radius:50%;
-          background:#000;
-          border:2px solid #888;
-          transform:translate(-50%,-50%);
-        }}
+def _escape(s: Any) -> str:
+    return html.escape("" if s is None else str(s))
 
-        .b737-label-bottom {{
-          margin-top:4px;
-          font-size:13px;
-          letter-spacing:1px;
-          color:#ddd;
-        }}
-      </style>
-    </head>
-    <body>
-      <div class="b737-card">
-        <div class="b737-dial">
-          {ticks_html}
-          <div class="b737-needle"></div>
-          <div class="b737-center"></div>
-        </div>
-        <div class="b737-label-bottom">FLAPS&nbsp;&nbsp;{flaps_str}</div>
-      </div>
-    </body>
-    </html>
+
+# ----------------------------------------------------------------------
+# Shared pipeline: take parsed info + aircraft → compute N1 → render UI
+# ----------------------------------------------------------------------
+def run_takeoff_pipeline_from_info(info: Dict[str, Any], aircraft: str):
+    """
+    Shared display pipeline: takes parsed SimBrief info + aircraft,
+    calls N1 dispatcher, and renders a text-based UI with consistent styling.
     """
 
-    components.html(html, height=230)
-
-
-# =========================
-# Streamlit UI
-# =========================
-
-def main():
-    st.title("SimBrief ➜ Infinite Flight Takeoff N1")
-
-    st.write(
-        "Paste your **SimBrief TAKEOFF PERFORMANCE** section below.\n\n"
-        "Currently supported aircraft:\n"
-        "- **B737 MAX 8**\n"
-        "- **B777-200ER**\n"
-        "- **A220-300 (A223)**\n"
-        "- **A380-800 (GP7270)**\n\n"
-        "For supported aircraft, this tool computes:\n"
-        "- Operational N1 and Infinite Flight power slider\n"
-        "- Flap setting and thrust profile (e.g. D-TO1 / D-TO2 / FLEX)\n"
-        "- V1 / VR / V2 speeds from SimBrief\n\n"
-        "Note: For the A380-800 we always assume **MAX takeoff (MTO)**, "
-        "even if SimBrief outputs FLEX or a derate."
-    )
-
-    simbrief_text = st.text_area(
-        "SimBrief Takeoff Performance Text",
-        height=350,
-        placeholder="Paste the SimBrief TAKEOFF PERFORMANCE block here...",
-    )
-
-    if st.button("Compute Takeoff Thrust"):
-        if not simbrief_text.strip():
-            st.warning("Please paste SimBrief text first.")
+    # A220-300: currently no TLR data in JSON → show overview only
+    n1_result = None
+    if aircraft == "A220-300":
+        st.warning(
+            "A220-300 detected.\n\n"
+            "SimBrief does not currently provide the TLR takeoff section we need via JSON "
+            "for this aircraft, so N1 calculations are not available yet.\n\n"
+            "Flight overview and METARs are still shown."
+        )
+    else:
+        if aircraft not in {"B737 MAX 8", "B777-200ER", "B777-300ER", "A380-800"}:
+            st.warning(
+                f"Aircraft '{aircraft}' is not yet supported for automatic N1.\n\n"
+                "Support for additional types will be added over time."
+            )
             return
 
-        aircraft = detect_aircraft(simbrief_text)
+        try:
+            n1_result = compute_takeoff_from_info(info, aircraft)
+        except Exception as e:
+            st.error(f"Error computing N1: {e}")
+            return
 
-        if aircraft in {"B737 MAX 8", "B777-200ER", "A220-300", "A380-800"}:
-            st.success(f"Detected aircraft: {aircraft}")
+    result: Dict[str, Any] = {}
+    if n1_result is not None:
+        result.update(n1_result)
 
+    # ------------------------------------------------------------------
+    # 1) Flight Overview
+    # ------------------------------------------------------------------
+    st.subheader("Flight Overview")
+
+    origin = info.get("origin") or result.get("airport")
+    origin_name = info.get("origin_name")
+    destination = info.get("destination")
+    destination_name = info.get("destination_name")
+
+    dep_runway = info.get("dep_runway") or info.get("runway")
+    dep_len = info.get("dep_runway_length_ft")
+    dep_elev = info.get("dep_elev_ft") or info.get("elevation_ft")
+
+    arr_runway = info.get("arr_runway")
+    arr_len = info.get("arr_runway_length_ft")
+    arr_elev = info.get("arr_elev_ft")
+
+    route_str = info.get("route_string")
+
+    orig_metar = info.get("orig_metar")
+    dest_metar = info.get("dest_metar")
+
+    # Departure vs Arrival cards (content INSIDE the card HTML)
+    c_dep, c_arr = st.columns(2)
+
+    with c_dep:
+        st.markdown('<div class="if-chip if-chip-blue">Departure</div>', unsafe_allow_html=True)
+
+        dep_title = origin or "N/A"
+        if origin and origin_name:
+            dep_title = f"{origin} – {origin_name}"
+
+        runway_line = f"<div><b>Runway:</b> {_escape(dep_runway)}</div>" if dep_runway else ""
+        details = []
+        if dep_elev is not None:
+            details.append(f"Elevation: {dep_elev:.0f} ft")
+        if dep_len is not None:
+            details.append(f"Length: {dep_len:.0f} ft")
+        details_line = f"<div>{_escape(' · '.join(details))}</div>" if details else ""
+
+        card_html = f"""
+        <div class="if-card">
+          <div style="font-size:1.35rem; font-weight:700; color:#f9fafb; margin-bottom:0.25rem;">
+            {_escape(dep_title)}
+          </div>
+          <div style="color:#e5e7eb; font-size:1rem; line-height:1.5;">
+            {runway_line}
+            {details_line}
+          </div>
+        </div>
+        """
+        st.markdown(card_html, unsafe_allow_html=True)
+
+    with c_arr:
+        st.markdown('<div class="if-chip if-chip-orange">Arrival</div>', unsafe_allow_html=True)
+
+        arr_title = destination or "N/A"
+        if destination and destination_name:
+            arr_title = f"{destination} – {destination_name}"
+
+        runway_line = f"<div><b>Runway:</b> {_escape(arr_runway)}</div>" if arr_runway else ""
+        details = []
+        if arr_elev is not None:
+            details.append(f"Elevation: {arr_elev:.0f} ft")
+        if arr_len is not None:
+            details.append(f"Length: {arr_len:.0f} ft")
+        details_line = f"<div>{_escape(' · '.join(details))}</div>" if details else ""
+
+        card_html = f"""
+        <div class="if-card">
+          <div style="font-size:1.35rem; font-weight:700; color:#f9fafb; margin-bottom:0.25rem;">
+            {_escape(arr_title)}
+          </div>
+          <div style="color:#e5e7eb; font-size:1rem; line-height:1.5;">
+            {runway_line}
+            {details_line}
+          </div>
+        </div>
+        """
+        st.markdown(card_html, unsafe_allow_html=True)
+
+    # Aircraft card (below the two columns)
+    st.markdown(
+        f"""
+        <div class="if-card">
+          <div class="if-card-title">Aircraft</div>
+          <div class="if-card-value">{_escape(aircraft)}</div>
+          <div class="if-card-sub">Based on SimBrief OFP and TLR data</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    # Route string
+    if route_str:
+        st.markdown(
+            f"""
+            <div class="if-card">
+              <div class="if-card-title">Route</div>
+              <div class="if-pre">{_escape(route_str)}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    # ------------------------------------------------------------------
+    # 2) METARs
+    # ------------------------------------------------------------------
+    if orig_metar or dest_metar:
+        st.subheader("Weather (METAR)")
+
+        m1, m2 = st.columns(2)
+
+        with m1:
+            st.markdown(
+                f'<div class="if-chip if-chip-blue">Departure METAR ({_escape(origin or "DEP")})</div>',
+                unsafe_allow_html=True,
+            )
+            decoded = decode_metar(orig_metar)
+            st.markdown(
+                f"""
+                <div class="if-card">
+                  <div class="if-small">{_escape(decoded)}</div>
+                  <div class="if-card-title" style="margin-top:0.6rem;">Raw METAR</div>
+                  <div class="if-pre">{_escape(orig_metar or "N/A")}</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+        with m2:
+            st.markdown(
+                f'<div class="if-chip if-chip-orange">Arrival METAR ({_escape(destination or "ARR")})</div>',
+                unsafe_allow_html=True,
+            )
+            decoded = decode_metar(dest_metar)
+            st.markdown(
+                f"""
+                <div class="if-card">
+                  <div class="if-small">{_escape(decoded)}</div>
+                  <div class="if-card-title" style="margin-top:0.6rem;">Raw METAR</div>
+                  <div class="if-pre">{_escape(dest_metar or "N/A")}</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+    st.markdown("---")
+
+    # If this aircraft has no N1 result (e.g., A220), stop here.
+    if n1_result is None:
+        return
+
+    # ------------------------------------------------------------------
+    # 3) Takeoff Settings (N1, IF slider, flaps)
+    # ------------------------------------------------------------------
+    st.subheader("Takeoff Settings")
+
+    n1_val = result.get("N1_percent")
+    slider_val = result.get("IF_slider_percent")
+    flaps = result.get("flaps") or info.get("flaps")
+
+    c1, c2, c3 = st.columns(3)
+
+    with c1:
+        value = f"{n1_val:.2f} %" if n1_val is not None else "N/A"
+        st.markdown(
+            f"""
+            <div class="if-card">
+              <div class="if-card-title">N1 (Operational)</div>
+              <div class="if-card-value">{_escape(value)}</div>
+              <div class="if-card-sub">Target engine N1 for takeoff</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    with c2:
+        value = f"{slider_val:.1f} %" if slider_val is not None else "N/A"
+        st.markdown(
+            f"""
+            <div class="if-card">
+              <div class="if-card-title">IF Power Slider</div>
+              <div class="if-card-value">{_escape(value)}</div>
+              <div class="if-card-sub">Set this in Infinite Flight</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    with c3:
+        value = flaps or "N/A"
+        st.markdown(
+            f"""
+            <div class="if-card">
+              <div class="if-card-title">Flap Setting</div>
+              <div class="if-card-value">{_escape(value)}</div>
+              <div class="if-card-sub">Takeoff configuration</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    # ------------------------------------------------------------------
+    # 4) Thrust profile & V-speeds
+    # ------------------------------------------------------------------
+    st.subheader("Thrust Profile & V-Speeds")
+
+    mode_raw = result.get("thrust_mode_raw") or info.get("mode_raw")
+    mode_norm = result.get("thrust_mode_normalized") or info.get("mode_normalized")
+    thrust_profile = mode_raw or mode_norm
+
+    speeds = result.get("speeds") or info.get("speeds") or {}
+    v1 = speeds.get("V1")
+    vr = speeds.get("VR")
+    v2 = speeds.get("V2")
+
+    t1, t2, t3, t4 = st.columns(4)
+
+    with t1:
+        st.markdown(
+            f"""
+            <div class="if-card">
+              <div class="if-card-title">Thrust Mode</div>
+              <div class="if-card-value">{_escape(thrust_profile or "N/A")}</div>
+              <div class="if-card-sub">TO / D-TO / FLEX</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    with t2:
+        val = f"{v1:.0f} kt" if v1 is not None else "N/A"
+        st.markdown(
+            f"""
+            <div class="if-card">
+              <div class="if-card-title">V1</div>
+              <div class="if-card-value">{_escape(val)}</div>
+              <div class="if-card-sub">Decision speed</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    with t3:
+        val = f"{vr:.0f} kt" if vr is not None else "N/A"
+        st.markdown(
+            f"""
+            <div class="if-card">
+              <div class="if-card-title">VR</div>
+              <div class="if-card-value">{_escape(val)}</div>
+              <div class="if-card-sub">Rotation speed</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    with t4:
+        val = f"{v2:.0f} kt" if v2 is not None else "N/A"
+        st.markdown(
+            f"""
+            <div class="if-card">
+              <div class="if-card-title">V2</div>
+              <div class="if-card-value">{_escape(val)}</div>
+              <div class="if-card-sub">Takeoff safety speed</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+
+# ----------------------------------------------------------------------
+# Main Streamlit app
+# ----------------------------------------------------------------------
+def main():
+    st.title("SimBrief → Infinite Flight Takeoff Helper")
+
+    st.write(
+        "Enter your **SimBrief username** and I'll pull the latest OFP, "
+        "detect the aircraft, and compute operational N1 + IF power level "
+        "for supported types."
+    )
+
+    username = st.text_input("SimBrief Username", value="", max_chars=64)
+
+    if st.button("Fetch from SimBrief") and username.strip():
+        with st.spinner("Fetching OFP from SimBrief..."):
             try:
-                result = compute_takeoff_from_simbrief(simbrief_text, aircraft)
+                ofp = fetch_simbrief_ofp_json(username.strip())
             except Exception as e:
-                st.error(f"Error computing N1: {e}")
+                st.error(f"Error fetching SimBrief OFP: {e}")
                 return
 
-            # === Row 1: Operational takeoff setting (numeric) ===
-            st.subheader("Operational Takeoff Setting")
-            row1_col1, row1_col2, row1_col3 = st.columns(3)
-            with row1_col1:
-                n1_val = result['N1_percent']
-                st.metric(
-                    "N1 (Operational)",
-                    f"{n1_val:.2f} %" if n1_val is not None else "N/A"
-                )
-            with row1_col2:
-                s_val = result['IF_slider_percent']
-                st.metric(
-                    "IF Power Slider",
-                    f"{s_val:.1f} %" if s_val is not None else "N/A"
-                )
-            with row1_col3:
-                st.metric("Flaps", result.get("flaps") or "N/A")
+        # Detect aircraft
+        aircraft = detect_aircraft_from_json(ofp) or "Unknown"
+        st.info(f"Detected aircraft from OFP: **{aircraft}**")
 
-            # === Row 2: Thrust profile + V-speeds ===
-            st.subheader("Thrust Profile & V-Speeds")
-            speeds = result.get("speeds", {})
-            v1 = speeds.get("V1")
-            vr = speeds.get("VR")
-            v2 = speeds.get("V2")
+        # Parse overview + takeoff data and merge
+        try:
+            overview = parse_ofp_overview_from_json(ofp)
+        except Exception as e:
+            st.error(f"Error parsing OFP overview from JSON: {e}")
+            return
 
-            row2_col1, row2_col2, row2_col3, row2_col4 = st.columns(4)
-            with row2_col1:
-                st.metric("Thrust Profile", result.get("thrust_mode_raw") or "N/A")
-            with row2_col2:
-                st.metric("V1", f"{v1} kt" if v1 is not None else "N/A")
-            with row2_col3:
-                st.metric("VR", f"{vr} kt" if vr is not None else "N/A")
-            with row2_col4:
-                st.metric("V2", f"{v2} kt" if v2 is not None else "N/A")
+        try:
+            tk = parse_takeoff_from_json(ofp)
+        except Exception as e:
+            st.error(f"Error parsing TLR takeoff data from JSON: {e}")
+            return
 
-            # === Row 3: Visual overview ===
-            st.subheader("Visual Takeoff Overview")
-            vcol1, vcol2 = st.columns(2)
+        info: Dict[str, Any] = {}
+        info.update(overview)
+        info.update(tk)
 
-            with vcol1:
-                st.caption("Engine Thrust Gauge (ECAM style)")
-                render_ecam_gauge(result['IF_slider_percent'], result['N1_percent'])
-
-            with vcol2:
-                st.caption("Flaps Configuration")
-                flaps_val = result.get("flaps")
-
-                if aircraft in {"A220-300", "A380-800"}:
-                    render_flaps_airbus(flaps_val)
-                elif aircraft == "B777-200ER":
-                    render_flaps_b777(flaps_val)
-                elif aircraft == "B737 MAX 8":
-                    render_flaps_737max(flaps_val)
-                else:
-                    st.write(flaps_val or "N/A")
-
-        else:
-            st.warning(
-                "This SimBrief text does not appear to be for a supported aircraft "
-                "(B737 MAX 8, B777-200ER, A220-300, A380-800).\n\n"
-                "Support for additional aircraft is in progress and "
-                "will be added in the future."
-            )
+        run_takeoff_pipeline_from_info(info, aircraft)
 
 
 if __name__ == "__main__":

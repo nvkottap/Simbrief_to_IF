@@ -144,13 +144,52 @@ def n1_and_slider_a380(
     mode: str,
     A_ft: float,
     T_c: float,
+    packs: str = "on",
+    eng_anti_ice: bool = False,
 ):
     """
     Main entry point for the app: returns (N1%, IF_slider%) for A380-800.
 
-    'mode' is currently ignored: we ALWAYS use MTO, regardless of SimBrief
-    (FLEX/derate/etc.), as per user request.
+    Currently we IGNORE `mode`, `packs`, and `eng_anti_ice` and always use
+    the MAX takeoff (MTO) table at the given altitude and temperature,
+    as per your design.
     """
     n1 = n1_a380_mto(A_ft, T_c)
     slider = slider_from_n1_a380(n1)
+    return n1, slider
+
+
+def compute_takeoff_n1(
+    pressure_alt_ft: float,
+    oat_C: float,
+    mode: str,
+    packs_on,
+    eng_anti_ice_on: bool,
+    sel_temp_C: float | None = None,
+):
+    """
+    Standard dispatcher entry point for the A380-800.
+    Per design, always uses MAX mode.
+    """
+
+    core_function = n1_and_slider_a380
+
+    # Packs → string
+    if isinstance(packs_on, bool):
+        packs_flag = "on" if packs_on else "off"
+    else:
+        packs_flag = "off" if str(packs_on).strip().lower() in {"off", "false", "0"} else "on"
+
+    # A380 ALWAYS uses MAX tables
+    mode_for_tables = "MAX"
+    temp_for_calc = oat_C
+
+    n1, slider = core_function(
+        mode_for_tables,
+        pressure_alt_ft,
+        temp_for_calc,
+        packs=packs_flag,
+        eng_anti_ice=eng_anti_ice_on,
+    )
+
     return n1, slider

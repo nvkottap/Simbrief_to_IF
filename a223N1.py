@@ -277,3 +277,42 @@ def n1_and_slider_a223(
     n1 = n1_a223(A_ft, T_c, mode=mode)
     slider = slider_from_n1_a223(n1)
     return n1, slider
+
+def compute_takeoff_n1(
+    pressure_alt_ft: float,
+    oat_C: float,
+    mode: str,
+    packs_on,
+    eng_anti_ice_on: bool,
+    sel_temp_C: float | None = None,
+):
+    """
+    Standard dispatcher entry point for the A220-300.
+    Delegates to this module’s n1_and_slider().
+    """
+
+    core_function = n1_and_slider_a223
+
+    # Packs → string
+    if isinstance(packs_on, bool):
+        packs_flag = "on" if packs_on else "off"
+    else:
+        packs_flag = "off" if str(packs_on).strip().lower() in {"off", "false", "0"} else "on"
+
+    mode = (mode or "MAX").upper()
+
+    temp_for_calc = oat_C
+    mode_for_tables = mode
+    if mode == "FLEX" and sel_temp_C:
+        temp_for_calc = sel_temp_C
+        mode_for_tables = "MAX"
+
+    n1, slider = core_function(
+        mode_for_tables,
+        pressure_alt_ft,
+        temp_for_calc,
+        packs=packs_flag,
+        eng_anti_ice=eng_anti_ice_on,
+    )
+
+    return n1, slider

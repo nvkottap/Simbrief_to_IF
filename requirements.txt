@@ -1,0 +1,24 @@
+# --- Core App Framework ---
+streamlit==1.32.2
+
+# --- METAR Decoding ---
+metar==1.8.0
+python-dateutil==2.9.0
+
+# --- Numerical / Interpolation ---
+numpy==1.26.4
+scipy==1.12.0
+pandas==2.2.2
+
+# --- Parsing / Utilities ---
+beautifulsoup4==4.12.3
+requests==2.31.0
+
+# --- PDF Parsing (for A380 charts, optional but recommended) ---
+pdfminer.six==20231228
+
+# --- Streamlit UI Extras (optional but helpful) ---
+streamlit-option-menu==0.3.12
+
+# --- Ensure compatibility and avoid dependency conflicts ---
+pytz==2024.1

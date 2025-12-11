@@ -203,3 +203,53 @@ def n1_and_slider_772(mode: str, A_ft: float, T_c: float):
     n1 = n1_772(A_ft, T_c, mode=mode)
     slider = slider_from_n1_772(n1)
     return n1, slider
+
+
+def compute_takeoff_n1(
+    pressure_alt_ft: float,
+    oat_C: float,
+    mode: str,
+    packs_on,
+    eng_anti_ice_on: bool,
+    sel_temp_C: float | None = None,
+):
+    """
+    Standard entry point for the B777-200ER used by utils.n1_dispatcher.
+
+    - Uses the 777-200ER MAX N1 table plus Boeing-style TO1/TO2 derates.
+    - FLEX (if present) is interpreted as MAX at SEL TEMP.
+    - `packs_on` is accepted for interface compatibility but currently
+      does not change the N1 (no PACKS delta tables yet).
+    """
+
+    # Normalize packs flag into 'on' / 'off' for future use
+    if isinstance(packs_on, bool):
+        packs_flag = "on" if packs_on else "off"
+    else:
+        p = str(packs_on).strip().lower()
+        packs_flag = "off" if p in {"off", "0", "false", "no"} else "on"
+
+    # Normalize mode
+    mode = (mode or "MAX").upper()
+
+    # FLEX handling: if FLEX and SEL TEMP is given, use SEL TEMP as the
+    # temperature but treat the mode as MAX for table lookup
+    temp_for_calc = oat_C
+    mode_for_tables = mode
+    if mode == "FLEX" and sel_temp_C is not None:
+        temp_for_calc = sel_temp_C
+        mode_for_tables = "MAX"
+
+    # Delegate to the core 777 logic
+    n1_percent, slider_percent = n1_and_slider_772(
+        mode_for_tables,
+        pressure_alt_ft,
+        temp_for_calc,
+    )
+
+    # packs_flag and eng_anti_ice_on are currently ignored, but we keep
+    # them in the signature for compatibility and future expansion.
+    _ = packs_flag
+    _ = eng_anti_ice_on
+
+    return n1_percent, slider_percent

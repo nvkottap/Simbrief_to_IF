@@ -233,3 +233,44 @@ def n1_and_slider(mode: str, A_ft: float, T_c: float,
         raise ValueError("Mode must be one of: MAX, TO1, TO2")
 
     return n1, slider_from_n1(n1)
+
+
+def compute_takeoff_n1(
+    pressure_alt_ft: float,
+    oat_C: float,
+    mode: str,
+    packs_on,
+    eng_anti_ice_on: bool,
+    sel_temp_C: float | None = None,
+):
+    """
+    Standard entry point for the A380-800 used by utils.n1_dispatcher.
+
+    Per your spec, we always assume MAX takeoff for the A380, regardless of
+    what SimBrief says. FLEX / derates are ignored.
+    """
+
+    # 👉 Point this at your real core function:
+    #    (replace `a388_n1_and_slider` with whatever your function is called)
+    core_a388_n1_function = n1_and_slider
+
+    # Normalize packs flag
+    if isinstance(packs_on, bool):
+        packs_flag = "on" if packs_on else "off"
+    else:
+        p = str(packs_on).strip().lower()
+        packs_flag = "off" if p in {"off", "0", "false", "no"} else "on"
+
+    # Force MAX mode and actual OAT (ignore FLEX for A380)
+    mode_for_tables = "MAX"
+    temp_for_calc = oat_C
+
+    n1_percent, slider_percent = core_a388_n1_function(
+        mode_for_tables,
+        pressure_alt_ft,
+        temp_for_calc,
+        packs=packs_flag,
+        eng_anti_ice=eng_anti_ice_on,
+    )
+
+    return n1_percent, slider_percent
