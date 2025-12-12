@@ -50,8 +50,6 @@ def detect_aircraft_from_json(ofp: Dict[str, Any]) -> Optional[str]:
 
 def detect_aircraft_from_text(text: str) -> Optional[str]:
     t = text.upper()
-
-    # Simple matches
     if "B737 MAX 8" in t or "737 MAX 8" in t or "B38M" in t:
         return "B737 MAX 8"
     if "B777-200ER" in t or "B772" in t:
@@ -62,7 +60,6 @@ def detect_aircraft_from_text(text: str) -> Optional[str]:
         return "A380-800"
     if "A220-300" in t or "A223" in t or "BCS3" in t:
         return "A220-300"
-
     return None
 
 
@@ -73,7 +70,7 @@ def detect_aircraft_from_text(text: str) -> Optional[str]:
 def is_flex_active(oat_C: Optional[float],
                    sel_temp_C: Optional[float],
                    mode_raw: Optional[str]) -> bool:
-    if mode_raw and "FLEX" in mode_raw.upper():
+    if mode_raw and "FLEX" in str(mode_raw).upper():
         return True
     if oat_C is not None and sel_temp_C is not None:
         if sel_temp_C > oat_C + 0.9:
@@ -103,6 +100,20 @@ def _safe_float(val: Any) -> Optional[float]:
         return float(val)
     except Exception:
         return None
+
+
+def _normalize_unit(u: Any) -> str:
+    """
+    Normalize SimBrief unit strings to either 'kg' or 'lb' where possible.
+    """
+    if not u:
+        return ""
+    s = str(u).strip().lower()
+    s = s.replace("kgs", "kg").replace("kilograms", "kg").replace("kilogram", "kg")
+    s = s.replace("lbs", "lb").replace("pounds", "lb").replace("pound", "lb")
+    if s in {"kg", "lb"}:
+        return s
+    return s
 
 
 # =============================================================================
@@ -137,6 +148,7 @@ def parse_takeoff_from_json(ofp: Dict[str, Any]) -> Dict[str, Any]:
     qnh = _safe_float(conds.get("altimeter"))
     elev_ft = _safe_float(rwy.get("elevation"))
 
+    # pressure altitude approximation (same approach you used earlier)
     pressure_alt_ft = None
     if elev_ft is not None and qnh is not None:
         pressure_alt_ft = elev_ft + 27.0 * (29.92 - qnh)
@@ -161,7 +173,7 @@ def parse_takeoff_from_json(ofp: Dict[str, Any]) -> Dict[str, Any]:
     def _safe_int(x):
         try:
             return int(round(float(x)))
-        except:
+        except Exception:
             return None
 
     speeds = {
@@ -192,116 +204,31 @@ def parse_takeoff_from_json(ofp: Dict[str, Any]) -> Dict[str, Any]:
 
 
 # =============================================================================
-# TEXT-BASED FALLBACK PARSER
-# =============================================================================
-
-def parse_takeoff_from_text(text: str) -> Dict[str, Any]:
-    t = text
-
-    def _find(pattern):
-        m = re.search(pattern, t, re.MULTILINE)
-        return m.group(1).strip() if m else None
-
-    def _find_float(pattern):
-        m = re.search(pattern, t, re.MULTILINE)
-        if not m:
-            return None
-        try:
-            return float(m.group(1))
-        except:
-            return None
-
-    airport = _find(r"APT\s+([A-Z0-9]{4})/")
-    runway = _find(r"RWY\s+([0-9A-Z]{2,3})/")
-    oat_C = _find_float(r"OAT\s+(-?\d+)")
-    qnh = _find_float(r"QNH\s+(\d+\.\d+)")
-    elev_ft = _find_float(r"ELEV\s+(-?\d+)")
-
-    flaps = _find(r"FLAPS\s+([0-9A-Z\+]+)")
-    thrust_raw = _find(r"THRUST\s+([A-Z0-9\-]+)")
-    sel_temp_C = _find_float(r"SEL TEMP\s+(-?\d+)")
-    bleeds = _find(r"BLEEDS\s+([A-Z]+)") or "AUTO"
-    aice_raw = _find(r"A/ICE\s+([A-Z]+)")
-
-    v1 = _find_float(r"V1\s+(\d+)")
-    vr = _find_float(r"VR\s+(\d+)")
-    v2 = _find_float(r"V2\s+(\d+)")
-
-    mode_normalized = _normalize_mode(thrust_raw or "")
-
-    packs_for_calc = (str(bleeds).upper() != "OFF")
-    anti_ice_for_calc = (str(aice_raw or "").upper() not in {"OFF", ""})
-
-    pressure_alt_ft = None
-    if elev_ft is not None and qnh is not None:
-        pressure_alt_ft = elev_ft + 27.0 * (29.92 - qnh)
-    else:
-        pressure_alt_ft = elev_ft
-
-    speeds = {
-        "V1": int(v1) if v1 else None,
-        "VR": int(vr) if vr else None,
-        "V2": int(v2) if v2 else None,
-    }
-
-    return {
-        "airport": airport,
-        "runway": runway,
-        "oat_C": oat_C,
-        "elevation_ft": elev_ft,
-        "pressure_alt_ft": pressure_alt_ft,
-        "qnh_inhg": qnh,
-
-        "mode_raw": thrust_raw,
-        "mode_normalized": mode_normalized,
-        "bleeds": bleeds,
-        "packs_for_calc": packs_for_calc,
-        "aice_raw": aice_raw,
-        "anti_ice_for_calc": anti_ice_for_calc,
-        "sel_temp_C": sel_temp_C,
-
-        "flaps": flaps,
-        "speeds": speeds,
-    }
-
-
-# =============================================================================
 # OFP OVERVIEW PARSER
 # =============================================================================
 
 def parse_ofp_overview_from_json(ofp: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Extracts:
-    - origin, destination (ICAO + names)
-    - departure and arrival runways (IDs, lengths, elevations)
-    - route string
-    - cruise level
-    - total enroute time
-    - block fuel
-    - ZFW, TOW
-    - passengers, cargo
-    - METARs
-    """
-
     general = ofp.get("general", {}) or {}
     weather = ofp.get("weather", {}) or {}
     weights = ofp.get("weights", {}) or {}
     fuel = ofp.get("fuel", {}) or {}
-    times = ofp.get("times", {}) or {}
     tlr = ofp.get("tlr", {}) or {}
+    units = ofp.get("units", {}) or {}
 
-    # --- Basic airports and names from "general" ---
+    # --- Units (NEW) ---
+    # Most reliable: ofp["units"]["weight"] / ["fuel"]
+    weight_unit = _normalize_unit(units.get("weight")) or _normalize_unit(weights.get("unit")) or _normalize_unit(general.get("units")) or "kg"
+    fuel_unit = _normalize_unit(units.get("fuel")) or weight_unit
+
     origin = general.get("orig_icao") or general.get("orig") or general.get("orig_code")
     dest = general.get("dest_icao") or general.get("dest") or general.get("dest_code")
 
     origin_name = general.get("orig_name")
     dest_name = general.get("dest_name")
 
-    # --- TLR sections for fallback airport info and runways ---
     takeoff = tlr.get("takeoff", {}) or {}
     landing = tlr.get("landing", {}) or {}
 
-    # Fallback to TLR conditions if general doesn't give us ICAOs
     if not origin:
         tconds = takeoff.get("conditions", {}) or {}
         origin = tconds.get("airport_icao") or origin
@@ -310,7 +237,7 @@ def parse_ofp_overview_from_json(ofp: Dict[str, Any]) -> Dict[str, Any]:
         lconds = landing.get("conditions", {}) or {}
         dest = lconds.get("airport_icao") or dest
 
-    # --- Departure runway info from TLR takeoff ---
+    # Departure runway info (TLR takeoff)
     dep_runway_id = None
     dep_runway_length_ft = None
     dep_elev_ft = None
@@ -330,12 +257,10 @@ def parse_ofp_overview_from_json(ofp: Dict[str, Any]) -> Dict[str, Any]:
 
         if sel_rwy:
             dep_runway_id = sel_rwy.get("identifier")
-            dep_runway_length_ft = _safe_float(
-                sel_rwy.get("length_tora") or sel_rwy.get("length")
-            )
+            dep_runway_length_ft = _safe_float(sel_rwy.get("length_tora") or sel_rwy.get("length"))
             dep_elev_ft = _safe_float(sel_rwy.get("elevation"))
 
-    # --- Arrival runway info from TLR landing (if present) ---
+    # Arrival runway info (TLR landing)
     arr_runway_id = None
     arr_runway_length_ft = None
     arr_elev_ft = None
@@ -355,48 +280,42 @@ def parse_ofp_overview_from_json(ofp: Dict[str, Any]) -> Dict[str, Any]:
 
         if sel_l_rwy:
             arr_runway_id = sel_l_rwy.get("identifier")
-            arr_runway_length_ft = _safe_float(
-                sel_l_rwy.get("length_lda") or sel_l_rwy.get("length")
-            )
+            arr_runway_length_ft = _safe_float(sel_l_rwy.get("length_lda") or sel_l_rwy.get("length"))
             arr_elev_ft = _safe_float(sel_l_rwy.get("elevation"))
 
-    # --- Route, fuel, weights etc. (unchanged) ---
-    route = (
-        general.get("route")
-        or general.get("navlog_route")
-        or general.get("plan_rte")
-    )
-    cruise_level = general.get("cruise_level")
-    if not cruise_level:
-        alt = general.get("cruise_altitude") or general.get("initial_altitude")
-        try:
-            alt = float(alt)
-            cruise_level = f"FL{int(round(alt / 100))}"
-        except Exception:
-            cruise_level = None
+    route = general.get("route") or general.get("navlog_route") or general.get("plan_rte")
 
-    total_ete = (
-        times.get("ete")
-        or times.get("enroute_time")
-        or times.get("block_time")
-    )
+    # --- Fuel / weights / payload ---
     block_fuel = (
-        fuel.get("block")
+        fuel.get("plan_ramp")
+        or fuel.get("block")
         or fuel.get("block_fuel")
         or fuel.get("total_fuel")
     )
+
     zfw = (
         weights.get("zfw")
         or weights.get("planned_zfw")
         or weights.get("est_zfw")
     )
+
     tow = (
         weights.get("tow")
         or weights.get("planned_tow")
         or weights.get("est_tow")
     )
-    pax = weights.get("pax") or weights.get("passengers")
-    cargo = weights.get("cargo") or weights.get("cargo_weight")
+
+    pax = (
+        weights.get("pax_count_actual")
+        or weights.get("pax")
+        or weights.get("passengers")
+    )
+
+    cargo = (
+        weights.get("cargo")
+        or weights.get("cargo_weight")
+        or general.get("cargo")
+    )
 
     orig_metar = weather.get("orig_metar") or weather.get("orig_metar_text")
     dest_metar = weather.get("dest_metar") or weather.get("dest_metar_text")
@@ -416,13 +335,19 @@ def parse_ofp_overview_from_json(ofp: Dict[str, Any]) -> Dict[str, Any]:
         "arr_elev_ft": arr_elev_ft,
 
         "route_string": route,
-        "cruise_level": cruise_level,
-        "total_ete": total_ete,
+
+        # payload/fuel summary
         "block_fuel": block_fuel,
         "zfw": zfw,
         "tow": tow,
         "pax": pax,
         "cargo": cargo,
+
+        # units (NEW)
+        "weight_unit": weight_unit,
+        "fuel_unit": fuel_unit,
+
+        # metars
         "orig_metar": orig_metar,
         "dest_metar": dest_metar,
     }
