@@ -444,7 +444,7 @@ def main():
         "detect the aircraft, and compute operational N1 + IF power level "
         "for supported types.\n\n"
         "Currently supported aircraft:\n\n"
-        "- Boeing 737-8 MAX)\n"
+        "- Boeing 737-8 MAX\n"
         "- Boeing 777-200ER\n"
         "- Airbus A380\n"
         
