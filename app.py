@@ -442,7 +442,12 @@ def main():
     st.write(
         "Enter your **SimBrief username** and I'll pull the latest OFP, "
         "detect the aircraft, and compute operational N1 + IF power level "
-        "for supported types."
+        "for supported types.\n\n"
+        "Currently supported aircraft:\n\n"
+        "- Boeing 737-8 MAX)\n"
+        "- Boeing 777-200ER\n"
+        "- Airbus A380\n"
+        
     )
 
     username = st.text_input("SimBrief Username", value="", max_chars=64)
